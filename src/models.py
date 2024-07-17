@@ -1,76 +1,70 @@
+#7 domain適応
+# 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops.layers.torch import Rearrange
+from torch.autograd import Function
 
+class GradientReversalFunction(Function):
+    @staticmethod
+    def forward(ctx, x):
+        return x.view_as(x)
 
-class BasicConvClassifier(nn.Module):
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg()
+
+class GradientReversalLayer(nn.Module):
+    def forward(self, x):
+        return GradientReversalFunction.apply(x)
+
+class TransformerClassifier(nn.Module):
     def __init__(
         self,
         num_classes: int,
         seq_len: int,
         in_channels: int,
-        hid_dim: int = 128
+        d_model: int = 256, #512
+        nhead: int = 8,
+        num_layers: int = 6,
+        dim_feedforward: int = 1024, #2048
+        dropout: float = 0.15
     ) -> None:
         super().__init__()
 
-        self.blocks = nn.Sequential(
-            ConvBlock(in_channels, hid_dim),
-            ConvBlock(hid_dim, hid_dim),
+        self.input_proj = nn.Linear(in_channels, d_model)
+        self.positional_encoding = nn.Parameter(torch.randn(seq_len, d_model))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
         )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        self.classifier = nn.Linear(d_model, num_classes)
 
-        self.head = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            Rearrange("b d 1 -> b d"),
-            nn.Linear(hid_dim, num_classes),
+        self.grl = GradientReversalLayer()
+        self.domain_classifier = nn.Sequential(
+            nn.Linear(d_model, 100),
+            nn.ReLU(),
+            nn.Linear(100, 4)  # 4は被験者の数
         )
-
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
-        """_summary_
-        Args:
-            X ( b, c, t ): _description_
-        Returns:
-            X ( b, num_classes ): _description_
-        """
-        X = self.blocks(X)
-
-        return self.head(X)
-
-
-class ConvBlock(nn.Module):
-    def __init__(
-        self,
-        in_dim,
-        out_dim,
-        kernel_size: int = 3,
-        p_drop: float = 0.1,
-    ) -> None:
-        super().__init__()
         
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-
-        self.conv0 = nn.Conv1d(in_dim, out_dim, kernel_size, padding="same")
-        self.conv1 = nn.Conv1d(out_dim, out_dim, kernel_size, padding="same")
-        # self.conv2 = nn.Conv1d(out_dim, out_dim, kernel_size) # , padding="same")
+    def forward(self, X: torch.Tensor, grl_lambda: float = 1.0) -> torch.Tensor:
+        X = X.permute(0, 2, 1)  # (b, c, t) -> (b, t, c)
+        X = self.input_proj(X)  # (b, t, d_model)
+        X = X + self.positional_encoding[:X.size(1), :]  # add positional encoding
+        X = self.transformer_encoder(X)  # (b, t, d_model)
         
-        self.batchnorm0 = nn.BatchNorm1d(num_features=out_dim)
-        self.batchnorm1 = nn.BatchNorm1d(num_features=out_dim)
+        # 分類タスク
+        class_out = self.classifier(X[:, 0, :])  # (b, num_classes)
+        
+        # ドメイン識別タスク
+        grl_out = self.grl(X[:, 0, :])
+        domain_out = self.domain_classifier(grl_out)
 
-        self.dropout = nn.Dropout(p_drop)
-
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
-        if self.in_dim == self.out_dim:
-            X = self.conv0(X) + X  # skip connection
-        else:
-            X = self.conv0(X)
-
-        X = F.gelu(self.batchnorm0(X))
-
-        X = self.conv1(X) + X  # skip connection
-        X = F.gelu(self.batchnorm1(X))
-
-        # X = self.conv2(X)
-        # X = F.glu(X, dim=-2)
-
-        return self.dropout(X)
+        return class_out, domain_out
